@@ -63,7 +63,7 @@ static void remove_debugfs_dir(const char *name)
     dput(dentry);
     dput(parent);
 }
-
+#ifdef CONFIG_ENABLE_DEVFREQ
 static int sky1_npu_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 {
     struct dev_pm_opp *opp;
@@ -243,7 +243,7 @@ static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix
 
     return 0;
 }
-
+#endif /* CONFIG_ENABLE_DEVFREQ */
 int sky1_npu_pm_runtime_get_sync(struct device *dev)
 {
 #ifdef CONFIG_PM
@@ -439,7 +439,8 @@ devfreq_init_failed:
 	return ret;
 }
 
-static int sky1_npu_remove(struct platform_device *p_dev)
+// Remplacez : static int sky1_npu_remove(struct platform_device *pdev)
+static void sky1_npu_remove(struct platform_device *pdev)
 {
 	dev_dbg(&p_dev->dev, "%s \n", __func__);
 #ifdef CONFIG_ENABLE_DEVFREQ
@@ -454,7 +455,7 @@ static int sky1_npu_remove(struct platform_device *p_dev)
 	pm_runtime_disable(&p_dev->dev);
 #endif /* CONFIG_PM */
 
-	return 0;
+	//return 0;
 }
 
 #ifdef CONFIG_PM
