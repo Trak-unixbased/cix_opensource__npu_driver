@@ -63,7 +63,7 @@ static void remove_debugfs_dir(const char *name)
     dput(dentry);
     dput(parent);
 }
-#ifdef CONFIG_ENABLE_DEVFREQ
+#ifdef CONFIG_ENABLE_DEVFREQ 
 static int sky1_npu_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 {
     struct dev_pm_opp *opp;
