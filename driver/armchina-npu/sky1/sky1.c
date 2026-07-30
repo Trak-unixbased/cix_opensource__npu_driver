@@ -266,7 +266,9 @@ int sky1_npu_pm_runtime_put(struct device *dev)
 #ifdef CONFIG_PM
 	int ret = 0;
 
-	ret = pm_runtime_put(dev);
+	pm_runtime_put(dev);
+	ret = 0;
+	/*ret = pm_runtime_put(dev);*/
 	if (ret < 0)
 		dev_err(dev, "PM runtime put failed! ret=%d", ret);
 
@@ -328,14 +330,14 @@ static struct aipu_soc_operations sky1_ops = {
 	.is_aipu_irq = NULL,
 };
 
-static int sky1_npu_probe(struct platform_device *p_dev)
+static int sky1_npu_probe(struct platform_device *pdev)
 {
 	int ret;
 	int i = 0;
 	u32 mask = 3;
 	struct fwnode_handle *child;
 
-	ret = device_property_read_u32(&p_dev->dev, "core_mask", &mask);
+	ret = device_property_read_u32(&pdev->dev, "core_mask", &mask);
 	if (mask == 0x1)
 	{
 		CIX_NPU_PD_NUM = 1;
@@ -343,17 +345,17 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 		return 0;
 	}
 
-	dev_info(&p_dev->dev, "%s: NPU core num is %d\n", __func__, CIX_NPU_PD_NUM);
+	dev_info(&pdev->dev, "%s: NPU core num is %d\n", __func__, CIX_NPU_PD_NUM);
 
-	sky1_priv_init(&p_dev->dev);
+	sky1_priv_init(&pdev->dev);
 
 	sky1.priv = cix_aipu_priv;
-	dev_set_drvdata(&p_dev->dev, cix_aipu_priv);
+	dev_set_drvdata(&pdev->dev, cix_aipu_priv);
 
-    if (has_acpi_companion(&p_dev->dev)) {
+    if (has_acpi_companion(&pdev->dev)) {
 #ifdef	CONFIG_ACPI
-		p_dev->dev.power.ignore_children = true;
-        fwnode_for_each_child_node(p_dev->dev.fwnode, child) {
+		pdev->dev.power.ignore_children = true;
+        fwnode_for_each_child_node(pdev->dev.fwnode, child) {
             if (is_acpi_data_node(child)) {
                 continue;
             }
@@ -374,28 +376,28 @@ static int sky1_npu_probe(struct platform_device *p_dev)
         }
 #endif
     } else {
-		ret = sky1_npu_attach_pd(&p_dev->dev, &sky1);
+		ret = sky1_npu_attach_pd(&pdev->dev, &sky1);
 		if (ret) {
-			dev_err(&p_dev->dev, "aipu attach pd failed, ret: %d\n", ret);
+			dev_err(&pdev->dev, "aipu attach pd failed, ret: %d\n", ret);
 			return ret;
 		}
     }
 
 #ifdef CONFIG_ENABLE_DEVFREQ
-	ret = sky1_npu_devfreq_init(&p_dev->dev, cix_aipu_priv);
+	ret = sky1_npu_devfreq_init(&pdev->dev, cix_aipu_priv);
 	if (ret) {
-		dev_err(&p_dev->dev, "aipu devfreq init failed, ret: %d\n", ret);
+		dev_err(&pdev->dev, "aipu devfreq init failed, ret: %d\n", ret);
 		goto devfreq_init_failed;
 	}
 #endif
 
 #ifdef CONFIG_PM
-	pm_runtime_get_noresume(&p_dev->dev);
-	pm_runtime_set_active(&p_dev->dev);
-    pm_runtime_enable(&p_dev->dev);
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_set_active(&pdev->dev);
+    pm_runtime_enable(&pdev->dev);
 #endif /* CONFIG_PM */
 
-    if (has_acpi_companion(&p_dev->dev)) {
+    if (has_acpi_companion(&pdev->dev)) {
 		for (i = 0; i < CIX_NPU_PD_NUM; i++) {
 			ret = pm_runtime_resume_and_get(cix_aipu_priv->pd_core[i]);
 			if (ret < 0)
@@ -403,32 +405,32 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 		}
     }
 
-    ret = armchina_aipu_probe(p_dev, &sky1, &sky1_ops);
+    ret = armchina_aipu_probe(pdev, &sky1, &sky1_ops);
     if (ret) {
-		dev_err(&p_dev->dev, "aipu real probe failed, ret: %d\n", ret);
+		dev_err(&pdev->dev, "aipu real probe failed, ret: %d\n", ret);
 		goto npu_probe_failed;
 	}
 
-	dev_err(&p_dev->dev, "%s: armchina_aipu_probe done\n", __func__); //TODO dbg
+	dev_err(&pdev->dev, "%s: armchina_aipu_probe done\n", __func__); //TODO dbg
 
 #ifdef CONFIG_PM
-    sky1_npu_pm_runtime_put(&p_dev->dev);
+    sky1_npu_pm_runtime_put(&pdev->dev);
 #endif /* CONFIG_PM */
 
     return 0;
 
 npu_probe_failed:
-	pm_runtime_put(&p_dev->dev);
+	pm_runtime_put(&pdev->dev);
 
-    if (has_acpi_companion(&p_dev->dev)) {
+    if (has_acpi_companion(&pdev->dev)) {
 		for (i = 0; i < CIX_NPU_PD_NUM; i++) {
 			pm_runtime_disable(cix_aipu_priv->pd_core[i]);
 		}
 	}
-	pm_runtime_disable(&p_dev->dev);
+	pm_runtime_disable(&pdev->dev);
 
 #ifdef CONFIG_ENABLE_DEVFREQ
-	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
+	sky1_npu_devfreq_remove(&pdev->dev, cix_aipu_priv);
 #endif
 
 devfreq_init_failed:
@@ -442,17 +444,17 @@ devfreq_init_failed:
 // Remplacez : static int sky1_npu_remove(struct platform_device *pdev)
 static void sky1_npu_remove(struct platform_device *pdev)
 {
-	dev_dbg(&p_dev->dev, "%s \n", __func__);
+	dev_dbg(&pdev->dev, "%s \n", __func__);
 #ifdef CONFIG_ENABLE_DEVFREQ
-	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
+	sky1_npu_devfreq_remove(&pdev->dev, cix_aipu_priv);
 #endif
 
-	armchina_aipu_remove(p_dev);
+	armchina_aipu_remove(pdev);
 
-	sky1_npu_detach_pd(&p_dev->dev, &sky1);
+	sky1_npu_detach_pd(&pdev->dev, &sky1);
 
 #ifdef CONFIG_PM
-	pm_runtime_disable(&p_dev->dev);
+	pm_runtime_disable(&pdev->dev);
 #endif /* CONFIG_PM */
 
 	//return 0;
@@ -462,11 +464,11 @@ static void sky1_npu_remove(struct platform_device *pdev)
 static int sky1_npu_runtime_suspend(struct device *dev)
 {
 	int ret = 0;
-	struct platform_device *p_dev = to_platform_device(dev);
+	struct platform_device *pdev = to_platform_device(dev);
 	pm_message_t state;
 	state.event = 0;
 
-	ret = armchina_aipu_suspend(p_dev, state);
+	ret = armchina_aipu_suspend(pdev, state);
 	if (ret) {
 		dev_err(dev, "aipu is busy, %s return %d\n", __func__, ret);
 		return ret;
@@ -474,7 +476,9 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 
 	if (has_acpi_companion(dev)) {
 		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
-			ret = pm_runtime_put(cix_aipu_priv->pd_core[i]);
+			/*ret = pm_runtime_put(cix_aipu_priv->pd_core[i]);*/
+			pm_runtime_put(cix_aipu_priv->pd_core[i]);
+			ret = 0;
 			if (ret < 0) {
 				dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime put failed! ret=%d", ret);
 				return ret;
@@ -488,7 +492,7 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 static int sky1_npu_runtime_resume(struct device *dev)
 {
 	int ret;
-	struct platform_device *p_dev = to_platform_device(dev);
+	struct platform_device *pdev = to_platform_device(dev);
 
 	if (has_acpi_companion(dev)) {
 		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
@@ -500,7 +504,7 @@ static int sky1_npu_runtime_resume(struct device *dev)
 		}
 	}
 
-	return armchina_aipu_resume(p_dev);
+	return armchina_aipu_resume(pdev);
 }
 
 static void npu_complete(struct device *dev) {
