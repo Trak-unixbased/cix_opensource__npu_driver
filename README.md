@@ -1,0 +1,1 @@
+CIXTECH NPU open-source driver for kernel 7 and above 
