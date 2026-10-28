@@ -4,6 +4,19 @@
 #include <linux/ioport.h>
 #include "aipu_io.h"
 
+/*
+ * Offsets reach these helpers from user space (AIPU_IOCTL_REQ_IO, sysfs):
+ * the access must be 32-bit aligned and fully inside the region. An
+ * unaligned readl()/writel() on Device memory raises an alignment fault on
+ * arm64 (kernel oops), and offset == size - 1 used to pass the old check.
+ */
+static bool aipu_io_offset_valid(struct io_region *region, int offset)
+{
+	return region && region->kern && offset >= 0 && region->size >= sizeof(u32) &&
+	       IS_ALIGNED(offset, sizeof(u32)) &&
+	       (u32)offset <= region->size - sizeof(u32);
+}
+
 /**
  * @init_aipu_ioregion() - initialize struct io_region using physical base address
  * @region:    pointer to struct io_region to be initialized
@@ -58,7 +71,7 @@ int aipu_read32(struct io_region *region, int offset)
 {
 	u32 val = 0;
 
-	if (region && region->kern && offset < region->size) {
+	if (aipu_io_offset_valid(region, offset)) {
 		val = readl((void __iomem *)((unsigned long)(region->kern) + offset));
 		pr_debug("[Read AIPU Register]: reg addr: 0x%llx + 0x%x, read back value: 0x%x\n",
 			 region->phys, offset, val);
@@ -75,8 +88,10 @@ int aipu_read32(struct io_region *region, int offset)
  */
 void aipu_write32(struct io_region *region, int offset, unsigned int data)
 {
-	if (region && region->kern && offset < region->size)
-		writel((u32)data, (void __iomem *)((unsigned long)(region->kern) + offset));
+	if (!aipu_io_offset_valid(region, offset))
+		return;
+
+	writel((u32)data, (void __iomem *)((unsigned long)(region->kern) + offset));
 	pr_debug("[Write AIPU Register]: reg addr: 0x%llx + 0x%x, write value: 0x%x\n",
 		 region->phys, offset, (u32)data);
 }
