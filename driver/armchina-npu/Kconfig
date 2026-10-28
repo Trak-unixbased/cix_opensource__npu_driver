@@ -2,63 +2,117 @@
 #
 # ArmChina Zhouyi NPU driver
 #
+# In-tree integration (e.g. drivers/misc/armchina-npu):
+#   drivers/misc/Kconfig  : source "drivers/misc/armchina-npu/Kconfig"
+#   drivers/misc/Makefile : obj-$(CONFIG_ARMCHINA_NPU) += armchina-npu/
+#
+# Out-of-tree builds (npu.mk / DKMS) do not read this file: they use
+# driver/Makefile, which hard-codes the SKY1 + Zhouyi V3 configuration.
+#
 
 config ARMCHINA_NPU
-	bool "ArmChina Zhouyi NPU"
+	tristate "ArmChina Zhouyi NPU support"
+	depends on ARM64 || COMPILE_TEST
+	depends on HAS_IOMEM && HAS_DMA
+	depends on OF || ACPI
+	# aipu_mm.c dereferences iommu_domain->iova_cookie and calls
+	# reserve_iova()/__free_iova(): both only exist with the DMA-IOMMU layer.
+	depends on IOMMU_DMA
+	select IOMMU_IOVA
+	select DMA_SHARED_BUFFER
 	help
-	  Say Y if you are using any Zhouyi NPU.
+	  Driver for the ArmChina Zhouyi AI accelerator (NPU), e.g. the
+	  Zhouyi V3 NPU of the CIX SKY1 / CD8180 SoC (Orange Pi 6 Plus).
+	  It exposes /dev/aipu to the Compass NOE user-mode driver.
 
-	  For other cases, say N.
+	  To compile this driver as a module, choose M here: the module
+	  will be called armchina_npu.
+
+if ARMCHINA_NPU
+
+comment "Zhouyi NPU architecture(s) supported by the driver"
 
 config ARMCHINA_NPU_ARCH_V1
-	bool "ArmChina NPU architecture: v1"
-	select ARMCHINA_NPU
+	bool "Zhouyi V1"
 	help
-	  Say Y if the NPU version on your SoC is Zhouyi V1.
-
-	  For other architecture versions, say N.
+	  Say Y if the NPU on your SoC is a Zhouyi V1 (e.g. Allwinner R329).
 
 config ARMCHINA_NPU_ARCH_V2
-	bool "ArmChina NPU architecture: v2"
-	select ARMCHINA_NPU
+	bool "Zhouyi V2 (Z2/Z3/X1)"
 	help
-	  Say Y if the NPU version on your SoC is Zhouyi V2 (i.e. Z2/Z3/X1).
-
-	  For other architecture versions, say N.
+	  Say Y if the NPU on your SoC is a Zhouyi V2 (Z2/Z3/X1).
 
 config ARMCHINA_NPU_ARCH_V3
-	bool "ArmChina NPU architecture: v3"
-	select ARMCHINA_NPU
+	bool "Zhouyi V3"
+	default y if ARCH_CIX
 	help
-	  Say Y if the NPU version on your SoC is Zhouyi V3.
-
-	  For other architecture versions, say N.
+	  Say Y if the NPU on your SoC is a Zhouyi V3. This is the NPU of the
+	  CIX SKY1 / CD8180 SoC (Orange Pi 6 Plus).
 
 config ARMCHINA_NPU_ARCH_V3_2
-	bool "ArmChina NPU architecture: v3_2"
-	select ARMCHINA_NPU
+	bool "Zhouyi V3_2"
 	help
-	  Say Y if the NPU version on your SoC is Zhouyi V3_2.
+	  Say Y if the NPU on your SoC is a Zhouyi V3_2.
 
-	  For other architecture versions, say N.
+comment "*** Select at least one Zhouyi architecture, probe fails otherwise ***"
+	depends on !ARMCHINA_NPU_ARCH_V1 && !ARMCHINA_NPU_ARCH_V2 && \
+		   !ARMCHINA_NPU_ARCH_V3 && !ARMCHINA_NPU_ARCH_V3_2
+
+# Every SoC glue file registers its own platform driver (module_init),
+# so exactly one of them can be linked into the module.
+choice
+	prompt "SoC platform glue"
+	default ARMCHINA_NPU_SOC_SKY1 if ARCH_CIX
+	default ARMCHINA_NPU_SOC_R329 if ARCH_SUNXI
+	default ARMCHINA_NPU_SOC_DEFAULT
+	help
+	  Select the SoC-specific glue (clocks, resets, power domains) used
+	  to probe the NPU.
 
 config ARMCHINA_NPU_SOC_DEFAULT
-	bool "Default SoC APIs"
+	bool "Generic (ArmChina default SoC API)"
+	depends on OF
 	help
-	  Say Y if you use the default SoC API implementations provided by ArmChina.
-
-	  For other SoCs, say N.
+	  Generic device-tree based glue provided by ArmChina.
 
 config ARMCHINA_NPU_SOC_R329
-	bool "R329 SoC APIs"
+	bool "Allwinner R329"
+	depends on OF
+	depends on ARCH_SUNXI || COMPILE_TEST
 	help
-	  Say Y if you use the Allwinner R329 SoC API implementations.
-
-	  For other SoCs, say N.
+	  Glue for the Allwinner R329 SoC.
 
 config ARMCHINA_NPU_SOC_SKY1
-	bool "SKY1 SoC APIs"
+	bool "CIX SKY1 / CD8180 (Orange Pi 6 Plus)"
+	depends on ARCH_CIX || COMPILE_TEST
 	help
-	  Say Y if you use the CIX SKY1 SoC API implementations.
+	  Glue for the CIX SKY1 / CD8180 SoC (clocks, resets, SCMI power
+	  domains, DT and ACPI probing). Say Y for the Orange Pi 6 Plus.
 
-	  For other SoCs, say N.
+endchoice
+
+config ARMCHINA_NPU_SKY1_DEVFREQ
+	bool "NPU DVFS through devfreq (CIX vendor kernel only)"
+	depends on ARMCHINA_NPU_SOC_SKY1
+	depends on PM_DEVFREQ && PM_OPP && DEVFREQ_GOV_USERSPACE
+	depends on ARM_SCMI_PROTOCOL=y || (ARM_SCMI_PROTOCOL=m && ARMCHINA_NPU=m)
+	help
+	  Scale the NPU frequency through devfreq (userspace governor) and
+	  SCMI performance domains.
+
+	  This relies on scmi_device_get_freq(), scmi_device_set_freq() and
+	  scmi_device_opp_table_parse(), which only exist in the CIX vendor
+	  kernel. Mainline and Ubuntu kernels do not provide them and the
+	  build then fails at link/modpost time.
+
+	  If unsure, say N.
+
+config ARMCHINA_NPU_KMD_VERSION
+	string "KMD version string reported to user space"
+	default "5.11.0"
+	help
+	  Version returned by the AIPU_IOCTL_GET_DRIVER_VERSION ioctl and
+	  checked by the Compass NOE user-mode driver. Keep it aligned with
+	  the UMD release in use.
+
+endif # ARMCHINA_NPU
