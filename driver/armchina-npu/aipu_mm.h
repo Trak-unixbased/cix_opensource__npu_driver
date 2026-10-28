@@ -19,6 +19,8 @@
 
 #define DEFERRED_FREE  1
 #define DMA_BUF_EXEC_ID 1
+/* one "never map" IOVA window per 4GB below the 32GB NPU bus limit */
+#define AIPU_MM_NEVER_MAP_MAX 8
 
 enum aipu_gm_policy {
 	AIPU_GM_POLICY_NONE         = 0,
@@ -241,12 +243,19 @@ struct aipu_sram_disable_per_fd {
  * @reg_cache: slab cache of the regions
  * @tbuf_cache: slab cache of the tcb descriptors
  * @importer_bufs: buffers from dma-buf importer(s)
+ * @reg_list_lock: lock for lookups of the region list from atomic context
  */
 struct aipu_memory_manager {
 	int version;
 	bool has_iommu;
 	struct device *dev;
 	struct mutex lock; /* Protect sram disabled head/importer bufs struct */
+	/*
+	 * Protects the mem.head region list against concurrent readers that
+	 * cannot sleep (IRQ handler, code under slock/manager->lock). Writers
+	 * hold both @lock and this lock (write side).
+	 */
+	rwlock_t reg_list_lock;
 	int res_cnt;
 	u32 valid_asid_cnt;
 	struct aipu_mem_region_list mem;
@@ -278,6 +287,10 @@ struct aipu_memory_manager {
 	u32 buffer_count;
 	u64 host_aipu_offset;
 	struct __cache_ops cache_ops;
+	/* IOVA ranges reserved in the DMA-API domain, released at deinit */
+	struct iova_domain *never_map_iovad;
+	struct iova *never_map_iova[AIPU_MM_NEVER_MAP_MAX];
+	int never_map_cnt;
 };
 
 int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, int version);
