@@ -4,19 +4,29 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/irqreturn.h>
+#include <linux/pm_runtime.h>
 #include "aipu_irq.h"
 #include "aipu_partition.h"
 #include "aipu_priv.h"
 
 static irqreturn_t aipu_irq_handler_upper_half(int irq, void *dev_id)
 {
-	struct aipu_priv *aipu =(((struct device *)dev_id)->driver_data);
-	struct aipu_partition *partition = aipu->partitions;
+	struct device *dev = dev_id;
+	struct aipu_priv *aipu = dev_get_drvdata(dev);
+	struct aipu_partition *partition = aipu ? aipu->partitions : NULL;
+
+	/*
+	 * The line is requested IRQF_SHARED: never touch the NPU registers
+	 * while it is runtime-suspended (power domain off), an access to an
+	 * unpowered IP ends in an SError on arm64.
+	 */
+	if (pm_runtime_suspended(dev))
+		return IRQ_NONE;
 
 	if (partition && partition->ops && partition->ops->upper_half)
 		return partition->ops->upper_half(partition);
 
-	pr_info("unexpected interrupt enter before finish zhouyi's initialization.\n");
+	dev_dbg(dev, "interrupt received before the NPU initialization is finished\n");
 	return IRQ_NONE;
 }
 
@@ -28,7 +38,8 @@ static void aipu_irq_handler_bottom_half(struct work_struct *work)
 	if (work) {
 		irq_obj = container_of(work, struct aipu_irq_object, work);
 		partition = irq_obj->partition;
-		partition->ops->bottom_half(partition);
+		if (partition && partition->ops && partition->ops->bottom_half)
+			partition->ops->bottom_half(partition);
 	}
 }
 
@@ -63,12 +74,19 @@ struct aipu_irq_object *aipu_create_irq_object(struct device *dev, u32 irqnum, v
 
 	INIT_WORK(&irq_obj->work, aipu_irq_handler_bottom_half);
 
-	/**
-	 * Flag IRQF_ONESHOT is used when sharing interrupts with other devices using thread_irq.
-	 * Remove it if you have no such a usage scenario.
+	/* set before request_irq(): a shared line can fire immediately */
+	irq_obj->partition = partition;
+
+	/*
+	 * IRQF_ONESHOT without a threaded handler is rejected with a WARN since
+	 * Linux 7.0. IRQF_COND_ONESHOT (6.9+) still lets us share the line with
+	 * a threaded ONESHOT user, which is what the old flag was meant for.
 	 */
 	ret = request_irq(irqnum, aipu_irq_handler_upper_half,
-			  IRQF_ONESHOT | IRQF_SHARED | IRQF_PROBE_SHARED,
+#ifdef IRQF_COND_ONESHOT
+			  IRQF_COND_ONESHOT |
+#endif
+			  IRQF_SHARED | IRQF_PROBE_SHARED,
 			  description, irq_obj->dev);
 	if (ret) {
 		dev_err(dev, "request_irq failed: irqnum %u, ret %d", irqnum, ret);
@@ -76,7 +94,6 @@ struct aipu_irq_object *aipu_create_irq_object(struct device *dev, u32 irqnum, v
 	}
 
 	irq_obj->irqnum = irqnum;
-	irq_obj->partition = partition;
 
 	goto finish;
 
@@ -95,13 +112,19 @@ finish:
 void aipu_destroy_irq_object(struct aipu_irq_object *irq_obj)
 {
 	if (irq_obj) {
+		/*
+		 * Free the IRQ first: the handler queues work, so flushing and
+		 * destroying the workqueue while the IRQ is still live could
+		 * queue work on a freed workqueue.
+		 */
+		if (irq_obj->irqnum)
+			free_irq(irq_obj->irqnum, irq_obj->dev);
+		irq_obj->irqnum = 0;
 		if (irq_obj->aipu_wq) {
-			flush_workqueue(irq_obj->aipu_wq);
+			cancel_work_sync(&irq_obj->work);
 			destroy_workqueue(irq_obj->aipu_wq);
 			irq_obj->aipu_wq = NULL;
 		}
-		if (irq_obj->irqnum)
-			free_irq(irq_obj->irqnum, irq_obj->dev);
 		kfree(irq_obj);
 	}
 }
@@ -122,5 +145,6 @@ void aipu_irq_schedulework(struct aipu_irq_object *irq_obj)
  */
 void aipu_irq_flush_workqueue(struct aipu_irq_object *irq_obj)
 {
-	flush_workqueue(irq_obj->aipu_wq);
+	if (irq_obj && irq_obj->aipu_wq)
+		flush_workqueue(irq_obj->aipu_wq);
 }

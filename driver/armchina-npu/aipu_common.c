@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/of.h>
+#include <linux/pm_runtime.h>
 #include "aipu_common.h"
 #include "aipu_partition.h"
 #ifdef CONFIG_SKY1
@@ -30,13 +31,18 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 		return 0;
 
 #ifdef CONFIG_SKY1
-       sky1_npu_pm_runtime_get_sync(aipu->dev);
+	/* never read registers of a powered-off NPU (SError) */
+	ret = pm_runtime_resume_and_get(aipu->dev);
+	if (ret < 0)
+		return ret;
+	ret = 0;
 #endif
 	if (get_soc_ops(partition) &&
 	    get_soc_ops(partition)->is_clk_enabled &&
 	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition))) {
-		return snprintf(buf, MAX_CHAR_SYSFS,
-		    "AIPU is suspended and external registers cannot be read!\n");
+		ret = snprintf(buf, MAX_CHAR_SYSFS,
+			       "AIPU is suspended and external registers cannot be read!\n");
+		goto out;
 	}
 
 	ret += snprintf(tmp, 512, "----------------------------------------------\n");
@@ -53,8 +59,9 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 	ret += snprintf(tmp, 512, "----------------------------------------------\n");
 	strcat(buf, tmp);
 
+out:
 #ifdef CONFIG_SKY1
-       sky1_npu_pm_runtime_put(aipu->dev);
+	pm_runtime_put(aipu->dev);
 #endif
 	return ret;
 }
@@ -70,53 +77,44 @@ ssize_t aipu_common_ext_register_sysfs_store(struct device *dev,
 	int value[2] = { 0 };
 	struct aipu_io_req io_req;
 
+	if (unlikely(!partition))
+		return -ENODEV;
+
 	if (get_soc_ops(partition) &&
 	    get_soc_ops(partition)->is_clk_enabled &&
 	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)))
 		return 0;
 
-#ifdef CONFIG_SKY1
-       sky1_npu_pm_runtime_get_sync(aipu->dev);
-#endif
-
+	/* parse first: the error paths used to leak the runtime PM reference */
 	ret = sscanf(buf, "%x %x", &value[0], &value[1]);
-	if (ret == ADDR_VALUE) {
-		io_req.rw = AIPU_IO_WRITE;
-		io_req.offset = value[0];
-		io_req.value = value[1];
-		dev_info(dev, "[SYSFS] write 0x%x into register offset 0x%x", value[1], value[0]);
-		if (io_req.offset % 4 == 0) {
-			partition->ops->io_rw(partition, &io_req);
-		} else {
-			dev_err(dev, "0x%x invalid address! 4 bytes alignment!\n", value[0]);
-			return -EINVAL;
-		}
-	} else {
+	if (ret != ADDR_VALUE) {
 		dev_info(dev, "echo \"addr_hex  value_hex\" > ext_registers\n");
 		return -EINVAL;
 	}
 
+	if (value[0] % 4) {
+		dev_err(dev, "0x%x invalid address! 4 bytes alignment!\n", value[0]);
+		return -EINVAL;
+	}
 
 #ifdef CONFIG_SKY1
-       sky1_npu_pm_runtime_put(aipu->dev);
+	ret = pm_runtime_resume_and_get(aipu->dev);
+	if (ret < 0)
+		return ret;
+#endif
+
+	memset(&io_req, 0, sizeof(io_req));
+	io_req.rw = AIPU_IO_WRITE;
+	io_req.offset = value[0];
+	io_req.value = value[1];
+	dev_info(dev, "[SYSFS] write 0x%x into register offset 0x%x", value[1], value[0]);
+	partition->ops->io_rw(partition, &io_req);
+
+#ifdef CONFIG_SKY1
+	pm_runtime_put(aipu->dev);
 #endif
 
 	return count;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 ssize_t aipu_common_clock_sysfs_show(struct device *dev,
@@ -187,6 +185,9 @@ ssize_t aipu_common_disable_sysfs_show(struct device *dev, struct device_attribu
 	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
 	struct aipu_partition *partition = aipu->partitions;
 
+	if (unlikely(!partition))
+		return -ENODEV;
+
 	if (atomic_read(&partition->disable)) {
 		return snprintf(buf, MAX_CHAR_SYSFS,
 		    "AIPU partition #%d is disabled (echo 0 > /sys/devices/platform/[dev]/disable to enable it).\n",
@@ -205,6 +206,9 @@ ssize_t aipu_common_disable_sysfs_store(struct device *dev, struct device_attrib
 	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
 	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
 	struct aipu_partition *partition = aipu->partitions;
+
+	if (unlikely(!partition))
+		return -ENODEV;
 
 	if ((strncmp(buf, "1", 1) == 0))
 		do_disable = 1;
@@ -236,11 +240,16 @@ struct device_attribute *aipu_common_create_attr(struct device *dev,
 	if (!*attr)
 		return ERR_PTR(-ENOMEM);
 
+	sysfs_attr_init(&(*attr)->attr);
 	(*attr)->attr.name = name;
 	(*attr)->attr.mode = mode;
 	(*attr)->show = show;
 	(*attr)->store = store;
-	device_create_file(dev, *attr);
+	if (device_create_file(dev, *attr)) {
+		kfree(*attr);
+		*attr = NULL;
+		return ERR_PTR(-EINVAL);
+	}
 
 	return *attr;
 }

@@ -1,0 +1,267 @@
+diff --git a/driver/armchina-npu/aipu.c b/driver/armchina-npu/aipu.c
+index f0ab855..1b0360d 100644
+--- a/driver/armchina-npu/aipu.c
++++ b/driver/armchina-npu/aipu.c
+@@ -11,6 +11,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/poll.h>
+ #include <linux/compat.h>
++#include <linux/mutex.h>
++#include <linux/lockdep.h>
+ #include <armchina_aipu.h>
+ #include "armchina_aipu_soc.h"
+ #include "aipu_mm.h"
+@@ -35,35 +37,58 @@
+  */
+ static struct aipu_priv *aipu;
+ 
++/*
++ * aipu_lock serialises the publication of 'aipu' / 'aipu_ready' between
++ * probe, remove and open. 'aipu_ready' is only set once create_partitions()
++ * has fully succeeded: testing 'aipu->partitions != NULL' is not enough,
++ * because v3_create_partitions() reads hardware registers and initialises
++ * the partition before the end of probe, so a racing open() could see a
++ * half-initialised NPU.
++ */
++static DEFINE_MUTEX(aipu_lock);
++static bool aipu_ready;
++static unsigned int aipu_open_cnt;
++
+ /* /dev/aipu is usable only once the job manager AND partitions exist. */
+ static bool aipu_is_ready(struct aipu_priv *priv)
+ {
+-	return priv && !aipu_priv_check_status(priv) && priv->partitions;
++	return READ_ONCE(aipu_ready) && priv && !aipu_priv_check_status(priv) &&
++	       priv->partitions;
+ }
+ 
+ static int aipu_open(struct inode *inode, struct file *filp)
+ {
+-	struct aipu_priv *priv = aipu;
+-	int ret;
++	struct aipu_priv *priv;
++	int ret = 0;
++
++	mutex_lock(&aipu_lock);
++	priv = aipu;
+ 
+ 	/*
+ 	 * misc_register() runs inside init_aipu_priv(), i.e. before the job
+ 	 * manager and partitions are ready: refuse early openers.
+ 	 */
+-	if (!aipu_is_ready(priv))
+-		return -ENODEV;
++	if (!aipu_is_ready(priv)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
+ 
+ #ifdef CONFIG_SKY1
+ 	/* resume_and_get drops the usage count itself on failure */
+ 	ret = pm_runtime_resume_and_get(priv->dev);
+ 	if (ret < 0) {
+ 		dev_err(priv->dev, "open: runtime resume failed: %d\n", ret);
+-		return ret;
++		goto out_unlock;
+ 	}
++	ret = 0;
+ #endif
+ 
++	aipu_open_cnt++;
+ 	filp->private_data = priv;
+-	return 0;
++
++out_unlock:
++	mutex_unlock(&aipu_lock);
++	return ret;
+ }
+ 
+ static int aipu_release(struct inode *inode, struct file *filp)
+@@ -89,6 +114,11 @@ static int aipu_release(struct inode *inode, struct file *filp)
+ 	pm_runtime_put(priv->dev);
+ #endif
+ 
++	mutex_lock(&aipu_lock);
++	if (!WARN_ON(!aipu_open_cnt))
++		aipu_open_cnt--;
++	mutex_unlock(&aipu_lock);
++
+ 	return 0;
+ }
+ 
+@@ -121,6 +151,10 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	struct aipu_rebind_buf_desc rebind_buf;
+ 	struct aipu_bind_buf_desc bind_buf;
+ 
++	/* device unbound while this fd was still open: refuse new work */
++	if (unlikely(!READ_ONCE(aipu_ready)))
++		return -ENODEV;
++
+ 	/*
+ 	 * Convention: a failed copy_{from,to}_user() returns -EFAULT, never
+ 	 * the raw "bytes not copied" count (positive value seen as success by
+@@ -405,6 +439,40 @@ static __poll_t aipu_poll(struct file *filp, struct poll_table_struct *wait)
+ 	return mask;
+ }
+ 
++/* Tear down the shared instance; caller holds aipu_lock. */
++static int aipu_remove_locked(void)
++{
++	struct aipu_priv *priv = aipu;
++	int ret = 0;
++
++	lockdep_assert_held(&aipu_lock);
++
++	/* stop accepting open()/ioctl() before tearing anything down */
++	WRITE_ONCE(aipu_ready, false);
++
++	if (!priv)
++		return 0;
++
++	/*
++	 * priv is devm-allocated: it is freed right after remove() returns,
++	 * even if a process still holds /dev/aipu open (its later release()
++	 * would then be a use-after-free). rmmod is already blocked by the
++	 * module refcount (fops.owner); a sysfs unbind is not. The real cure
++	 * is .suppress_bind_attrs = true in the SoC platform_driver.
++	 */
++	if (aipu_open_cnt)
++		dev_warn(priv->dev,
++			 "removed while /dev/aipu still open %u time(s): close users first\n",
++			 aipu_open_cnt);
++
++	if (priv->is_init)
++		ret = deinit_aipu_priv(priv);
++
++	/* priv is devm-managed and about to be freed: drop the global ref */
++	aipu = NULL;
++	return ret;
++}
++
+ static const struct file_operations aipu_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = aipu_open,
+@@ -438,14 +506,20 @@ int armchina_aipu_probe(struct platform_device *p_dev, struct aipu_soc *soc,
+ 	int ret = 0;
+ 	struct device *dev = &p_dev->dev;
+ 	struct aipu_partition *partition = NULL;
+-	struct aipu_priv *priv = aipu;
++	struct aipu_priv *priv;
++	bool created = false;
+ 	u32 id = 0;
+ 
++	mutex_lock(&aipu_lock);
++	priv = aipu;
++
+ 	/* create & init aipu priv struct shared by all clusters/cores */
+ 	if (!priv) {
+ 		priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+-		if (!priv)
+-			return -ENOMEM;
++		if (!priv) {
++			ret = -ENOMEM;
++			goto out_unlock;
++		}
+ 
+ 		dev_info(dev, "AIPU KMD (v%s) probe start...\n", KMD_VERSION);
+ 
+@@ -453,15 +527,16 @@ int armchina_aipu_probe(struct platform_device *p_dev, struct aipu_soc *soc,
+ 
+ 		/*
+ 		 * Publish the pointer before init: misc_register() happens
+-		 * inside, and aipu_open() relies on is_init/partitions checks
+-		 * (aipu_is_ready) to reject early openers.
++		 * inside, but aipu_open() takes aipu_lock and checks
++		 * aipu_ready, so early openers are rejected.
+ 		 */
+ 		aipu = priv;
++		created = true;
+ 		ret = init_aipu_priv(priv, p_dev, &aipu_fops, soc, ops);
+ 		if (ret) {
+ 			/* devm memory is released when probe fails: forget it */
+ 			aipu = NULL;
+-			return ret;
++			goto out_unlock;
+ 		}
+ 	}
+ 
+@@ -480,10 +555,22 @@ int armchina_aipu_probe(struct platform_device *p_dev, struct aipu_soc *soc,
+ 		goto out_clean;
+ 	}
+ 
++	/* pairs with READ_ONCE() in aipu_is_ready()/aipu_ioctl() */
++	WRITE_ONCE(aipu_ready, true);
++	mutex_unlock(&aipu_lock);
+ 	return 0;
+ 
+ out_clean:
+-	armchina_aipu_remove(p_dev);
++	/*
++	 * Only tear down the shared instance if it was created by THIS call:
++	 * with several AIPU platform devices (v1/v2 multi-core), a failure on
++	 * the 2nd core must not destroy the instance owned (and devm-allocated)
++	 * by the 1st, still bound, device.
++	 */
++	if (created)
++		aipu_remove_locked();
++out_unlock:
++	mutex_unlock(&aipu_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(armchina_aipu_probe);
+@@ -500,17 +587,12 @@ EXPORT_SYMBOL(armchina_aipu_probe);
+  */
+ int armchina_aipu_remove(struct platform_device *p_dev)
+ {
+-	struct aipu_priv *priv = aipu;
+-	int ret = 0;
+-
+-	if (!priv)
+-		return 0;
++	int ret;
+ 
+-	if (priv->is_init)
+-		ret = deinit_aipu_priv(priv);
++	mutex_lock(&aipu_lock);
++	ret = aipu_remove_locked();
++	mutex_unlock(&aipu_lock);
+ 
+-	/* priv is devm-managed and about to be freed: drop the global ref */
+-	aipu = NULL;
+ 	return ret;
+ }
+ EXPORT_SYMBOL(armchina_aipu_remove);
+diff --git a/driver/armchina-npu/aipu_dma_buf.c b/driver/armchina-npu/aipu_dma_buf.c
+index 3e85001..1df0681 100755
+--- a/driver/armchina-npu/aipu_dma_buf.c
++++ b/driver/armchina-npu/aipu_dma_buf.c
+@@ -380,6 +380,9 @@ int aipu_detach_dma_buf(struct aipu_memory_manager *mm, int fd)
+ 	return ret;
+ }
+ 
+-#if KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE
++#if KERNEL_VERSION(6, 13, 0) <= LINUX_VERSION_CODE
++/* since 6.13 the namespace is a string literal (commit cdd30ebb1b9f) */
++MODULE_IMPORT_NS("DMA_BUF");
++#elif KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE
+ MODULE_IMPORT_NS(DMA_BUF);
+ #endif
+diff --git a/driver/armchina-npu/aipu_mm.c b/driver/armchina-npu/aipu_mm.c
+index 90a4e52..7f43766 100755
+--- a/driver/armchina-npu/aipu_mm.c
++++ b/driver/armchina-npu/aipu_mm.c
+@@ -2737,7 +2737,14 @@ static struct page **aipu_dma_alloc_pages(struct device *dev,
+ 	struct page **pages;
+ 	unsigned int i = 0, nid = dev_to_node(dev);
+ 
++	/* MAX_ORDER is inclusive since 6.4 and renamed MAX_PAGE_ORDER in 6.8 */
++#if KERNEL_VERSION(6, 8, 0) <= LINUX_VERSION_CODE
++	order_mask &= (2U << MAX_PAGE_ORDER) - 1;
++#elif KERNEL_VERSION(6, 4, 0) <= LINUX_VERSION_CODE
+ 	order_mask &= (2U << MAX_ORDER) - 1;
++#else
++	order_mask &= (1U << MAX_ORDER) - 1;
++#endif
+ 	//pr_info("order_mask 0x%lx\n", order_mask);
+ 	if (!order_mask)
+ 		return NULL;

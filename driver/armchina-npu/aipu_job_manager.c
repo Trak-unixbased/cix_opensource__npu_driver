@@ -347,7 +347,9 @@ static void reserve_core_for_job_no_lock(struct aipu_job_manager *manager, struc
 	sched_core = &manager->partitions[job->core_id];
 	manager->idle_bmap[job->core_id] = 0;
 	if (job->desc.enable_prof) {
-		get_soc_ops(sched_core)->start_bw_profiling(sched_core->dev, get_soc(sched_core));
+		if (get_soc_ops(sched_core) && get_soc_ops(sched_core)->start_bw_profiling)
+			get_soc_ops(sched_core)->start_bw_profiling(sched_core->dev,
+								    get_soc(sched_core));
 		job->sched_time = ktime_get();
 	}
 
@@ -522,6 +524,16 @@ static int schedule_v3_job_no_lock(struct aipu_job_manager *manager, struct aipu
 	return ret;
 }
 
+/* undo create_aipu_job() for a job that was never put on scheduled_head */
+static void drop_unqueued_job(struct aipu_job_manager *manager, struct aipu_job *job)
+{
+	mutex_lock(&manager->wq_lock);
+	if (job->thread_queue)
+		delete_wait_node(&manager->wait_queue_head, job->thread_queue);
+	destroy_aipu_job(manager, job);
+	mutex_unlock(&manager->wq_lock);
+}
+
 static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_desc *user_job,
 			    struct file *filp, int do_trigger)
 {
@@ -539,7 +551,11 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 		queue = create_thread_wait_queue(manager->wait_queue_head,
 						 task_pid_nr(current), NULL);
 
-	WARN_ON(IS_ERR(queue));
+	/* the ERR_PTR() used to be dereferenced by init_aipu_job() */
+	if (IS_ERR(queue)) {
+		mutex_unlock(&manager->wq_lock);
+		return PTR_ERR(queue);
+	}
 
 	kern_job = create_aipu_job(manager, user_job, queue, filp);
 	if (IS_ERR(kern_job)) {
@@ -552,6 +568,8 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 		ret = aipu_mm_hold_tcb_buf_alloc(manager->mm, kern_job);
 		if (ret != 0) {
 			dev_err(manager->dev, "malloc placeholder tcb failed.\n");
+			/* the job was never queued: drop it instead of leaking it */
+			drop_unqueued_job(manager, kern_job);
 			return -ENOMEM;
 		}
 	}
@@ -616,7 +634,9 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 			dev_err(manager->dev, "schedule new job (0x%llx) failed: invalid core ID %u",
 				kern_job->desc.job_id, user_job->core_id);
 			ret = -EINVAL;
-			goto unlock;
+			spin_unlock_irqrestore(&manager->lock, flags);
+			drop_unqueued_job(manager, kern_job);
+			return ret;
 		}
 
 		kern_job->state = AIPU_JOB_STATE_DEFERRED;
@@ -704,11 +724,24 @@ int init_aipu_job_manager(struct aipu_job_manager *manager, struct aipu_memory_m
 #else
 	manager->prof_cache = NULL;
 #endif
+	if (!manager->job_cache)
+		return -ENOMEM;
+
 	mutex_init(&manager->wq_lock);
-	manager->scheduled_head = create_aipu_job(manager, NULL, NULL, NULL);
-	INIT_LIST_HEAD(&manager->scheduled_head->node);
 	spin_lock_init(&manager->lock);
+	manager->scheduled_head = create_aipu_job(manager, NULL, NULL, NULL);
+	if (IS_ERR(manager->scheduled_head)) {
+		manager->scheduled_head = NULL;
+		ret = -ENOMEM;
+		goto err;
+	}
+	INIT_LIST_HEAD(&manager->scheduled_head->node);
 	manager->wait_queue_head = create_thread_wait_queue(NULL, 0, NULL);
+	if (IS_ERR(manager->wait_queue_head)) {
+		manager->wait_queue_head = NULL;
+		ret = -ENOMEM;
+		goto err;
+	}
 	mutex_init(&manager->id_lock);
 	manager->exec_flag = 0;
 	manager->mm = mm;
@@ -717,9 +750,6 @@ int init_aipu_job_manager(struct aipu_job_manager *manager, struct aipu_memory_m
 	manager->asid0_base = aipu_mm_get_asid_base(mm, AIPU_BUF_ASID_0);
 	atomic_set(&manager->tick_counter, 0);
 	atomic_set(&manager->is_suspend, 0);
-
-	WARN_ON(IS_ERR(manager->scheduled_head));
-	WARN_ON(IS_ERR(manager->wait_queue_head));
 
 	memset(&manager->exit_tcb_desc, 0, sizeof(manager->exit_tcb_desc));
 
@@ -731,20 +761,40 @@ int init_aipu_job_manager(struct aipu_job_manager *manager, struct aipu_memory_m
 			devm_kzalloc(manager->dev,
 				     BITS_TO_LONGS(manager->group_id_num) * sizeof(long),
 				     GFP_KERNEL);
-		if (!manager->group_id_bmap)
-			return -ENOMEM;
+		if (!manager->group_id_bmap) {
+			ret = -ENOMEM;
+			goto err;
+		}
 
 		manager->sflag_id_num = 0xffff;
 		manager->sflag_id_bmap =
 			devm_kzalloc(manager->dev,
 				     BITS_TO_LONGS(manager->sflag_id_num) * sizeof(long),
 				     GFP_KERNEL);
+		/* was set before the NULL check */
+		if (!manager->sflag_id_bmap) {
+			ret = -ENOMEM;
+			goto err;
+		}
 		bitmap_set(manager->sflag_id_bmap, 0, 1);
-		if (!manager->sflag_id_bmap)
-			return -ENOMEM;
 	}
 
 	manager->is_init = 1;
+	return ret;
+
+err:
+	/* init failed: is_init stays 0, so deinit would not clean this up */
+	kfree(manager->wait_queue_head);
+	manager->wait_queue_head = NULL;
+	if (manager->scheduled_head)
+		kmem_cache_free(manager->job_cache, manager->scheduled_head);
+	manager->scheduled_head = NULL;
+	kmem_cache_destroy(manager->job_cache);
+	manager->job_cache = NULL;
+#if AIPU_CONFIG_ENABLE_INTR_PROFILING
+	kmem_cache_destroy(manager->prof_cache);
+	manager->prof_cache = NULL;
+#endif
 	return ret;
 }
 
@@ -796,7 +846,10 @@ void aipu_job_manager_set_partitions_info(struct aipu_job_manager *manager, int 
 					      GFP_KERNEL);
 	}
 	manager->idle_bmap = kmalloc_array(partition_cnt, sizeof(bool), GFP_KERNEL);
-	memset(manager->idle_bmap, 1, partition_cnt);
+	if (manager->idle_bmap)
+		memset(manager->idle_bmap, 1, partition_cnt);
+	else
+		dev_err(manager->dev, "set partitions info: no memory for idle bitmap\n");
 }
 
 /**
@@ -1146,13 +1199,20 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 			else
 				curr->state = AIPU_JOB_STATE_SUCCESS;
 
+			/*
+			 * SoC profiling hooks are optional (all NULL on SKY1):
+			 * calling them unconditionally oopsed in hard IRQ context
+			 * as soon as user space enabled profiling.
+			 */
 			if (curr->desc.enable_prof) {
+				struct aipu_soc_operations *soc_ops = get_soc_ops(partition);
+
 				curr->done_time = ktime_get();
-				get_soc_ops(partition)->stop_bw_profiling(partition->dev,
-									  get_soc(partition));
-				get_soc_ops(partition)->read_profiling_reg(partition->dev,
-									   get_soc(partition),
-									   &curr->pdata);
+				if (soc_ops && soc_ops->stop_bw_profiling)
+					soc_ops->stop_bw_profiling(partition->dev, get_soc(partition));
+				if (soc_ops && soc_ops->read_profiling_reg)
+					soc_ops->read_profiling_reg(partition->dev, get_soc(partition),
+								    &curr->pdata);
 			}
 
 			if (atomic_read(&manager->tick_counter) && info)
@@ -1343,7 +1403,8 @@ int aipu_job_manager_abort_cmd_pool(struct aipu_job_manager *manager)
 	if (!manager)
 		return -EINVAL;
 
-	if (!manager->pools->created)
+	/* pools only exist on v3+ once the partitions are created */
+	if (!manager->pools || !manager->partitions || !manager->pools->created)
 		return -ENODEV;
 
 	partition = &manager->partitions[0];
@@ -1380,38 +1441,33 @@ int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *
 	struct aipu_partition *par = NULL;
 	bool multi_process = false;
 	bool abort_cmd_pool = false;
-	int job_total = 0;
-	int job_index = 0;
-	struct aipu_job **delete_jobs = NULL;
+	LIST_HEAD(delete_jobs);
 
 	if (!manager || !filp)
 		return -EINVAL;
-	spin_lock_irqsave(&manager->lock, flags);
-	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
-		if (curr->filp == filp)
-			job_total++;
-	}
-	spin_unlock_irqrestore(&manager->lock, flags);
-	delete_jobs = kcalloc(job_total, sizeof(*delete_jobs), GFP_KERNEL);
-	if (!delete_jobs)
-		return -ENOMEM;
 
-	/* jobs should be cleaned first */
+	/*
+	 * Jobs are moved to a private list in a single locked pass. The old
+	 * code counted them, dropped the lock, allocated an array and filled
+	 * it in a second pass: a job queued in between by another thread of
+	 * the same file overflowed that array.
+	 */
 	spin_lock_irqsave(&manager->lock, flags);
 	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
 		if (curr->filp == filp) {
-			par = &manager->partitions[curr->core_id];
+			/* core_id is -1 for v3 jobs: only index partitions for v1/v2 */
 			if (curr->desc.aipu_version < AIPU_ISA_VERSION_ZHOUYI_V3 &&
-			    (curr->state == AIPU_JOB_STATE_DEFERRED ||
-			     (curr->state == AIPU_JOB_STATE_RUNNING && par->ops->is_idle(par))))
-				manager->idle_bmap[curr->core_id] = 1;
+			    curr->core_id >= 0 && curr->core_id < manager->partition_cnt) {
+				par = &manager->partitions[curr->core_id];
+				if (curr->state == AIPU_JOB_STATE_DEFERRED ||
+				    (curr->state == AIPU_JOB_STATE_RUNNING && par->ops->is_idle(par)))
+					manager->idle_bmap[curr->core_id] = 1;
+			}
 
 			if ((manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3) &&
 				curr->state == AIPU_JOB_STATE_RUNNING)
 				abort_cmd_pool = true;
-			delete_jobs[job_index] = curr;
-			job_index++;
-			list_del(&curr->node);
+			list_move_tail(&curr->node, &delete_jobs);
 		} else {
 			multi_process = true;
 		}
@@ -1430,14 +1486,15 @@ int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *
 		aipu_job_manager_abort_cmd_pool(manager);
 
 	mutex_lock(&manager->wq_lock);
-	for (job_index = 0; job_index < job_total; job_index++) {
-		delete_wait_node(&manager->wait_queue_head, delete_jobs[job_index]->thread_queue);
-		kmem_cache_free(manager->job_cache, delete_jobs[job_index]);
+	list_for_each_entry_safe(curr, next, &delete_jobs, node) {
+		list_del(&curr->node);
+		if (curr->thread_queue)
+			delete_wait_node(&manager->wait_queue_head, curr->thread_queue);
+		destroy_aipu_job(manager, curr);
 	}
 	delete_thread_wait_queue(manager->wait_queue_head, task_pid_nr(current), filp);
 	mutex_unlock(&manager->wq_lock);
 
-	kfree(delete_jobs);
 	return 0;
 }
 
@@ -1448,11 +1505,11 @@ int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *
  *
  * Return: 0 on success and error code otherwise.
  */
-int aipu_job_manager_invalidate_timeout_job(struct aipu_job_manager *manager, int job_id)
+int aipu_job_manager_invalidate_timeout_job(struct aipu_job_manager *manager, u64 job_id)
 {
-	int ret = 0;
 	struct aipu_job *curr = NULL;
 	struct aipu_job *next = NULL;
+	struct aipu_job *found = NULL;
 	unsigned long flags;
 
 	if (!manager)
@@ -1463,17 +1520,27 @@ int aipu_job_manager_invalidate_timeout_job(struct aipu_job_manager *manager, in
 		if (curr->uthread_id == task_pid_nr(current) &&
 		    curr->desc.job_id == job_id) {
 			list_del(&curr->node);
+			found = curr;
 			break;
 		}
 	}
 	spin_unlock_irqrestore(&manager->lock, flags);
 
+	/*
+	 * When no job matched, 'curr' pointed at the list head container: the
+	 * original code then destroyed scheduled_head itself (user-triggerable
+	 * use-after-free with any unknown job ID).
+	 */
+	if (!found)
+		return -EINVAL;
+
 	mutex_lock(&manager->wq_lock);
-	delete_wait_node(&manager->wait_queue_head, curr->thread_queue);
-	destroy_aipu_job(manager, curr);
+	if (found->thread_queue)
+		delete_wait_node(&manager->wait_queue_head, found->thread_queue);
+	destroy_aipu_job(manager, found);
 	mutex_unlock(&manager->wq_lock);
 
-	return ret;
+	return 0;
 }
 
 /**
@@ -1494,15 +1561,22 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	struct aipu_job **done_jobs = NULL;
 	int poll_iter = 0;
 	unsigned long flags;
+	u32 max_cnt = 0;
 
 	if (unlikely(!manager || !job_status || job_status->max_cnt < 1))
 		return -EINVAL;
 
-	status = kcalloc(job_status->max_cnt, sizeof(*status), GFP_KERNEL);
+	/*
+	 * max_cnt comes from user space: bound the allocations (poll_cnt tells
+	 * the caller how many entries were really returned).
+	 */
+	max_cnt = min_t(u32, job_status->max_cnt, AIPU_JOB_STATUS_MAX_CNT);
+
+	status = kcalloc(max_cnt, sizeof(*status), GFP_KERNEL);
 	if (!status)
 		return -ENOMEM;
 
-	done_jobs = kcalloc(job_status->max_cnt, sizeof(*done_jobs), GFP_KERNEL);
+	done_jobs = kcalloc(max_cnt, sizeof(*done_jobs), GFP_KERNEL);
 	if (!done_jobs) {
 		kfree(status);
 		return -ENOMEM;
@@ -1511,7 +1585,7 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	job_status->poll_cnt = 0;
 	spin_lock_irqsave(&manager->lock, flags);
 	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
-		if (job_status->poll_cnt == job_status->max_cnt)
+		if (job_status->poll_cnt == max_cnt)
 			break;
 
 		if (curr->state < AIPU_JOB_STATE_EXCEP)
@@ -1543,12 +1617,9 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	spin_unlock_irqrestore(&manager->lock, flags);
 
 #if AIPU_CONFIG_ENABLE_INTR_PROFILING
-	spin_unlock_irqrestore(&manager->lock, flags);
-
+	/* the lock is already released above (this used to unlock it twice) */
 	for (poll_iter = 0; poll_iter < job_status->poll_cnt; poll_iter++)
 		aipu_job_manager_dump_pdata(manager, done_jobs[poll_iter]);
-
-	spin_lock_irqsave(&manager->lock, flags);
 #endif
 
 	mutex_lock(&manager->wq_lock);
@@ -1558,8 +1629,11 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	}
 	mutex_unlock(&manager->wq_lock);
 
-	ret = copy_to_user((struct job_status_desc __user *)job_status->status, status,
-			   job_status->poll_cnt * sizeof(*status));
+	/* copy_to_user() returns the number of bytes left, not an errno */
+	if (job_status->poll_cnt &&
+	    copy_to_user((void __user *)job_status->status, status,
+			 job_status->poll_cnt * sizeof(*status)))
+		ret = -EFAULT;
 
 	kfree(status);
 	kfree(done_jobs);
@@ -1584,7 +1658,7 @@ bool aipu_job_manager_has_end_job(struct aipu_job_manager *manager, struct file 
 	unsigned long flags;
 
 	if (unlikely(!manager || !filp))
-		return -EINVAL;
+		return false; /* was -EINVAL, i.e. "true" for a bool */
 
 	mutex_lock(&manager->wq_lock);
 	list_for_each_entry(wq, &manager->wait_queue_head->node, node) {
@@ -1638,22 +1712,29 @@ int aipu_job_manager_get_running_job_thread(struct aipu_job_manager *manager,
 	unsigned long flags;
 	struct aipu_job *curr = NULL;
 	unsigned int core_i = 0;
-	struct aipu_partition partition;
+	unsigned int max_i = 0;
 
 	if (!manager || !query)
 		return -EINVAL;
 
 	if (manager->version < AIPU_ISA_VERSION_ZHOUYI_V3)
 		return 0;
-	partition = manager->partitions[0];
+	if (!manager->partitions)
+		return -ENODEV;
+
+	/*
+	 * The old bound (core_i > core_cnt after the store) wrote one entry too
+	 * many; also never go past the UAPI array. The struct used to be
+	 * copied by value (mutexes included) just to read core_cnt.
+	 */
+	max_i = min_t(unsigned int, manager->partitions[0].clusters[0].core_cnt,
+		      ARRAY_SIZE(query->thread_id));
 	spin_lock_irqsave(&manager->lock, flags);
 	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
-		if (curr->state == AIPU_JOB_STATE_RUNNING) {
-			query->thread_id[core_i] = curr->uthread_id;
-			core_i++;
-			if (core_i > partition.clusters[0].core_cnt)
-				break;
-		}
+		if (core_i >= max_i)
+			break;
+		if (curr->state == AIPU_JOB_STATE_RUNNING)
+			query->thread_id[core_i++] = curr->uthread_id;
 	}
 	spin_unlock_irqrestore(&manager->lock, flags);
 	return 0;
@@ -1704,6 +1785,9 @@ int aipu_job_manager_config_clusters(struct aipu_job_manager *manager,
 	if (manager->version < AIPU_ISA_VERSION_ZHOUYI_V3)
 		return 0;
 
+	if (!manager->partitions)
+		return -ENODEV;
+
 	partition = &manager->partitions[0];
 
 	spin_lock_irqsave(&manager->lock, flags);
@@ -1716,7 +1800,7 @@ int aipu_job_manager_config_clusters(struct aipu_job_manager *manager,
 		}
 	}
 
-	for (idx = 0; idx < partition->cluster_cnt; idx++) {
+	for (idx = 0; idx < partition->cluster_cnt && idx < ARRAY_SIZE(cfg->clusters); idx++) {
 		en_count = cfg->clusters[idx].en_core_cnt;
 		core_cnt = partition->clusters[idx].core_cnt;
 
@@ -1760,7 +1844,21 @@ int aipu_job_manager_resume(struct aipu_job_manager *manager)
 	if (!manager)
 		return -EINVAL;
 
-	cfg.clusters[0].en_core_cnt = manager->partitions[0].clusters[0].core_cnt;
+	if (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3 && !manager->partitions)
+		return -ENODEV;
+
+	/*
+	 * clusters[1..7] were left uninitialised (stack garbage): re-enable
+	 * every core of every cluster, as at probe time.
+	 */
+	memset(&cfg, 0, sizeof(cfg));
+	if (manager->partitions) {
+		struct aipu_partition *partition = &manager->partitions[0];
+		u32 idx = 0;
+
+		for (idx = 0; idx < partition->cluster_cnt && idx < ARRAY_SIZE(cfg.clusters); idx++)
+			cfg.clusters[idx].en_core_cnt = partition->clusters[idx].core_cnt;
+	}
 
 	if (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3)
 		return aipu_job_manager_config_clusters(manager, &cfg);

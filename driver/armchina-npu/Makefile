@@ -1,85 +1,28 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# Out-of-tree Kbuild file for the ArmChina Zhouyi V3 NPU on CIX SKY1 / CD8180
-# (Orange Pi 6 Plus). Driven by ../npu.mk or by DKMS (dkms.conf).
+# In-tree Kbuild file for the ArmChina Zhouyi NPU driver, used when this
+# directory is copied to e.g. drivers/misc/armchina-npu (see Kconfig).
 #
-# Knobs (command line or environment):
-#   BUILD_AIPU_VERSION_KMD           BUILD_ZHOUYI_V3 (only value supported)
-#   BUILD_TARGET_PLATFORM_KMD        BUILD_PLATFORM_SKY1 (only value supported)
-#   COMPASS_DRV_BTENVAR_KMD_VERSION  version string reported to the UMD
-#   BUILD_NPU_DEVFREQ=y|n            DVFS, needs scmi_device_*() (CIX vendor kernel)
-#   AIPU_SKIP_IOVA_RESERVE=y|n       skip the "never map" IOVA reservation
+# Out-of-tree builds (npu.mk / DKMS) do not use this file: they go through
+# ../Makefile, which builds aipu.ko for SKY1 + Zhouyi V3 directly.
+#
+# This file used to be a copy of ../Makefile: in-tree it then ignored
+# CONFIG_ARMCHINA_NPU and pointed at armchina-npu/armchina-npu/... paths.
 
-BUILD_AIPU_VERSION_KMD          ?= BUILD_ZHOUYI_V3
-BUILD_TARGET_PLATFORM_KMD       ?= BUILD_PLATFORM_SKY1
-COMPASS_DRV_BTENVAR_KMD_VERSION ?= 5.11.0
-BUILD_NPU_DEVFREQ               ?= n
-AIPU_SKIP_IOVA_RESERVE          ?= n
+ccflags-y += -I$(src) -I$(src)/include -I$(src)/zhouyi
+# string CONFIG_ values are unquoted in include/config/auto.conf
+ccflags-y += -DKMD_VERSION='"$(CONFIG_ARMCHINA_NPU_KMD_VERSION)"'
 
-ifneq ($(KERNELRELEASE),)
-# ------------------------------------------------------------------ Kbuild
-ifneq ($(BUILD_AIPU_VERSION_KMD),BUILD_ZHOUYI_V3)
-$(error aipu: only BUILD_AIPU_VERSION_KMD=BUILD_ZHOUYI_V3 is supported by this Kbuild)
-endif
-ifneq ($(BUILD_TARGET_PLATFORM_KMD),BUILD_PLATFORM_SKY1)
-$(error aipu: only BUILD_TARGET_PLATFORM_KMD=BUILD_PLATFORM_SKY1 is supported by this Kbuild)
-endif
+# the sources test these historical names rather than the Kconfig symbols
+ccflags-$(CONFIG_ARMCHINA_NPU_SOC_SKY1)        += -DCONFIG_SKY1
+ccflags-$(CONFIG_ARMCHINA_NPU_SKY1_DEVFREQ)    += -DCONFIG_ENABLE_DEVFREQ
 
-AIPU_DIR := $(src)/armchina-npu
+obj-$(CONFIG_ARMCHINA_NPU) += armchina_npu.o
+armchina_npu-y := aipu.o aipu_common.o aipu_io.o aipu_irq.o \
+		  aipu_job_manager.o aipu_mm.o aipu_dma_buf.o aipu_priv.o \
+		  aipu_tcb.o
 
-ccflags-y += -DCONFIG_SKY1 \
-             -DCONFIG_ARMCHINA_NPU_ARCH_V3 \
-             -D$(BUILD_AIPU_VERSION_KMD) \
-             -D$(BUILD_TARGET_PLATFORM_KMD) \
-             -DKMD_VERSION=\"$(COMPASS_DRV_BTENVAR_KMD_VERSION)\" \
-             -I$(AIPU_DIR) \
-             -I$(AIPU_DIR)/include \
-             -I$(AIPU_DIR)/zhouyi
-
-ifeq ($(BUILD_NPU_DEVFREQ),y)
-ccflags-y += -DCONFIG_ENABLE_DEVFREQ
-endif
-ifeq ($(AIPU_SKIP_IOVA_RESERVE),y)
-ccflags-y += -DAIPU_SKIP_IOVA_RESERVE
-endif
-
-# Vendor code is not prototype-clean; keep CONFIG_WERROR kernels building.
-ccflags-y += -Wno-missing-prototypes -Wno-unused-label -Wno-unused-function
-
-obj-m := aipu.o
-aipu-y := armchina-npu/sky1/sky1.o \
-          armchina-npu/aipu.o \
-          armchina-npu/aipu_common.o \
-          armchina-npu/aipu_io.o \
-          armchina-npu/aipu_irq.o \
-          armchina-npu/aipu_job_manager.o \
-          armchina-npu/aipu_mm.o \
-          armchina-npu/aipu_dma_buf.o \
-          armchina-npu/aipu_priv.o \
-          armchina-npu/aipu_tcb.o \
-          armchina-npu/zhouyi/zhouyi.o \
-          armchina-npu/zhouyi/v3.o \
-          armchina-npu/zhouyi/v3_priv.o
-
-else
-# ------------------------------------------------------------------ wrapper
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
-
-KBUILD_ARGS := -C $(KDIR) M=$(PWD) \
-	BUILD_AIPU_VERSION_KMD=$(BUILD_AIPU_VERSION_KMD) \
-	BUILD_TARGET_PLATFORM_KMD=$(BUILD_TARGET_PLATFORM_KMD) \
-	COMPASS_DRV_BTENVAR_KMD_VERSION=$(COMPASS_DRV_BTENVAR_KMD_VERSION) \
-	BUILD_NPU_DEVFREQ=$(BUILD_NPU_DEVFREQ) \
-	AIPU_SKIP_IOVA_RESERVE=$(AIPU_SKIP_IOVA_RESERVE)
-
-.PHONY: all modules modules_install clean
-all modules:
-	$(MAKE) $(KBUILD_ARGS) modules
-
-modules_install:
-	$(MAKE) $(KBUILD_ARGS) modules_install
-
-clean:
-	$(MAKE) $(KBUILD_ARGS) clean
-endif
+include $(src)/zhouyi/Makefile
+include $(src)/default/Makefile
+include $(src)/r329/Makefile
+include $(src)/sky1/Makefile

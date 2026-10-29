@@ -43,6 +43,12 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 	/* get clusters of this partition */
 	for (iter = 0; iter < tot_cluster; iter++) {
 		if (partition->id == clusters[2 * iter + 1]) {
+			/* partition->clusters[] has ARRAY_SIZE() entries (UBSAN/overflow) */
+			if (cluster_cnt >= ARRAY_SIZE(partition->clusters)) {
+				dev_err(partition->dev, "too many clusters in partition %d\n",
+					partition->id);
+				return -EINVAL;
+			}
 			cluster_cnt++;
 			partition->clusters[cluster_cnt - 1].id = clusters[2 * iter];
 			val = aipu_read32(partition->reg, CLUSTER_CONFIG_REG(clusters[2 * iter]));
@@ -56,8 +62,13 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 			partition->clusters[cluster_cnt - 1].gm_bytes =
 				get_gm_size(aipu_read32(partition->reg, DEBUG_CLUSTER_GM_CONTROL));
 			aipu_write32(partition->reg, DEBUG_PAGE_SELECTION_REG, DISABLE_DEBUG);
-			ret = aipu_mm_init_gm(&partition->priv->mm,
-					      partition->clusters[cluster_cnt - 1].gm_bytes);
+			/*
+			 * GM is optional (gm-policy = 0): the -EINVAL returned then
+			 * used to become the partition init result and fail probe.
+			 */
+			if (aipu_mm_init_gm(&partition->priv->mm,
+					    partition->clusters[cluster_cnt - 1].gm_bytes))
+				dev_dbg(partition->dev, "GM not used (policy none)\n");
 		}
 	}
 
@@ -105,19 +116,35 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	 * One cluster should only be within one partition.
 	 */
 	ret = device_property_count_u32(&p_dev->dev, "cluster-partition");
-	if (ret <= 0) {
-		dev_warn(&p_dev->dev, "use the default config (1 cluster)");
-		ret = 2;
+	if (ret > 0 && ret < 2) {
+		dev_err(&p_dev->dev, "check your dts or acpi table: bad cluster-partition");
+		return ERR_PTR(-EINVAL);
 	}
 
-	cluster_cnt = ret >> 1;
-	WARN_ON(!cluster_cnt);
+	cluster_cnt = ret > 0 ? ret >> 1 : 1;
+	if (cluster_cnt > MAX_CLUSTER_NUM) {
+		dev_err(&p_dev->dev, "%u clusters declared, at most %d supported\n",
+			cluster_cnt, MAX_CLUSTER_NUM);
+		return ERR_PTR(-EINVAL);
+	}
 
-	cluster_arr = devm_kzalloc(&p_dev->dev, cluster_cnt * 2 * sizeof(u32), GFP_KERNEL);
+	cluster_arr = devm_kcalloc(&p_dev->dev, cluster_cnt * 2, sizeof(u32), GFP_KERNEL);
+	if (!cluster_arr)
+		return ERR_PTR(-ENOMEM);
 
-	if (device_property_read_u32_array(&p_dev->dev, "cluster-partition", cluster_arr,
-			cluster_cnt * 2)) {
+	if (ret <= 0) {
+		/*
+		 * The property is optional: the old code announced a default
+		 * config and then failed the probe reading the missing array.
+		 * Default: cluster 0 in partition 0.
+		 */
+		dev_warn(&p_dev->dev, "use the default config (1 cluster)");
+		cluster_arr[0] = 0;
+		cluster_arr[1] = 0;
+	} else if (device_property_read_u32_array(&p_dev->dev, "cluster-partition", cluster_arr,
+						  cluster_cnt * 2)) {
 		dev_err(&p_dev->dev, "check your dts or acpi table: read cluster-partition failed");
+		devm_kfree(&p_dev->dev, cluster_arr);
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -126,21 +153,27 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 			partition_cnt = cluster_arr[2 * iter + 1] + 1;
 	}
 
-	partitions = devm_kzalloc(&p_dev->dev, sizeof(*partitions) * partition_cnt, GFP_KERNEL);
-	if (!partitions)
+	partitions = devm_kcalloc(&p_dev->dev, partition_cnt, sizeof(*partitions), GFP_KERNEL);
+	if (!partitions) {
+		devm_kfree(&p_dev->dev, cluster_arr);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	/* register base and interrupt are shared among all partitions */
 	/* do this before calling init_aipu_partition() */
 	ret = aipu_common_init_reg_irq(p_dev, &partitions[0], &aipu->reg, &aipu->irq_obj);
-	if (ret)
-		return ERR_PTR(ret);
+	if (ret) {
+		devm_kfree(&p_dev->dev, partitions);
+		partitions = ERR_PTR(ret);
+		goto finish;
+	}
 
 	/* global soft-reset before per partition config */
 	ret = aipu->ops->global_soft_reset(aipu);
 	if (ret) {
 		dev_err(&p_dev->dev, "[init partition] global soft reset failed");
-		return ERR_PTR(ret);
+		/* the IRQ and the register mapping used to be leaked here */
+		goto init_partition_fail;
 	}
 
 	build_info = aipu_read32(&aipu->reg, TSM_BUILD_INFO_REG);
@@ -156,7 +189,8 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 		if (!IS_CLUSTER_PRESENT(aipu_read32(&aipu->reg, CLUSTER_CONFIG_REG(iter)))) {
 			dev_err(&p_dev->dev,
 				"AIPU cluster #%d was not found but registered in dts\n", iter);
-			return ERR_PTR(-EINVAL);
+			ret = -EINVAL;
+			goto init_partition_fail;
 		}
 	}
 
@@ -178,6 +212,8 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	goto finish;
 
 init_partition_fail:
+	for (iter = 0; iter < partition_cnt; iter++)
+		aipu_common_destroy_attr(&p_dev->dev, &partitions[iter].reg_attr);
 	aipu_destroy_irq_object(aipu->irq_obj);
 	aipu->irq_obj = NULL;
 	deinit_aipu_ioregion(&aipu->reg);
@@ -205,7 +241,7 @@ static void v3_destroy_partitions(struct aipu_priv *aipu)
 		aipu->reg.kern = NULL;
 		aipu->reg.phys = 0;
 		aipu->reg.size = 0;
-		for (i = 0; i < aipu->partition_cnt; i++)
+		for (i = 0; aipu->partitions && i < aipu->partition_cnt; i++)
 			aipu_common_destroy_attr(aipu->partitions[i].dev,
 						 &aipu->partitions[i].reg_attr);
 	}

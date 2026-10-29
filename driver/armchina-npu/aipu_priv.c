@@ -9,14 +9,21 @@
 #include "v2.h"
 #include "v3.h"
 #include "v3_2.h"
+#include "aipu_dma_buf.h"
 
 static int init_misc_dev(struct aipu_priv *aipu)
 {
+	int ret = 0;
+
 	aipu->misc.minor = MISC_DYNAMIC_MINOR;
 	aipu->misc.name = "aipu";
 	aipu->misc.fops = aipu->aipu_fops;
 	aipu->misc.mode = 0666;
-	return misc_register(&aipu->misc);
+	ret = misc_register(&aipu->misc);
+	/* deinit_misc_dev() keys on misc.fops: never deregister a failed one */
+	if (ret)
+		memset(&aipu->misc, 0, sizeof(aipu->misc));
+	return ret;
 }
 
 static void deinit_misc_dev(struct aipu_priv *aipu)
@@ -104,15 +111,19 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 		goto finish;
 	}
 
-	ret = init_misc_dev(aipu);
-	if (ret)
-		goto err_handle;
-
 	ret = aipu_init_mm(&aipu->mm, p_dev, version);
 	if (ret)
 		goto err_handle;
 
 	ret = init_aipu_job_manager(&aipu->job_manager, &aipu->mm, aipu);
+	if (ret)
+		goto err_handle;
+
+	/*
+	 * Expose /dev/aipu last, once everything it relies on exists
+	 * (aipu_open() still checks that the partitions are ready).
+	 */
+	ret = init_misc_dev(aipu);
 	if (ret)
 		goto err_handle;
 
@@ -137,10 +148,14 @@ int deinit_aipu_priv(struct aipu_priv *aipu)
 	if (!aipu)
 		return 0;
 
-	aipu->ops->destroy_partitions(aipu);
-	deinit_aipu_job_manager(&aipu->job_manager);
-	aipu_deinit_mm(&aipu->mm);
+	/* no new opener while the rest is torn down */
 	deinit_misc_dev(aipu);
+	if (aipu->ops && aipu->ops->destroy_partitions)
+		aipu->ops->destroy_partitions(aipu);
+	deinit_aipu_job_manager(&aipu->job_manager);
+	aipu_dma_buf_release_importers(&aipu->mm);
+	if (aipu->mm.dev)
+		aipu_deinit_mm(&aipu->mm);
 	aipu->is_init = 0;
 
 	return 0;
@@ -189,7 +204,7 @@ int aipu_priv_query_partition_capability(struct aipu_priv *aipu, struct aipu_par
 	u32 core_cnt = 0;
 	u32 en_core_cnt = 0;
 
-	if (unlikely(!aipu && !cap))
+	if (unlikely(!aipu || !cap))
 		return -EINVAL;
 
 	for (id = 0; id < aipu->partition_cnt; id++) {
@@ -200,7 +215,8 @@ int aipu_priv_query_partition_capability(struct aipu_priv *aipu, struct aipu_par
 		cap[id].config = partition->config;
 		cap[id].info.reg_base = partition->reg->phys;
 		cap[id].cluster_cnt = partition->cluster_cnt;
-		for (iter = 0; iter < partition->cluster_cnt; iter++) {
+		for (iter = 0; iter < partition->cluster_cnt &&
+		     iter < ARRAY_SIZE(cap[id].clusters); iter++) {
 			core_cnt = partition->clusters[iter].core_cnt;
 			en_core_cnt = atomic_read(&partition->clusters[iter].en_core_cnt);
 
@@ -229,6 +245,9 @@ int aipu_priv_query_capability(struct aipu_priv *aipu, struct aipu_cap *cap)
 		return -EINVAL;
 
 	cap->partition_cnt = aipu_priv_get_partition_cnt(aipu);
+	if (!cap->partition_cnt || !aipu->partitions)
+		return -ENODEV;
+
 	cap->is_homogeneous = 1;
 	cap->asid_cnt = aipu_mm_get_asid_cnt(&aipu->mm);
 
